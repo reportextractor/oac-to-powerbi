@@ -447,9 +447,15 @@ def ensure_dir(path: str) -> None:
 
 def text(elem: ET.Element) -> str:
     """
-    Extract trimmed text from an element; empty string if None.
+    Extract trimmed text from an element, including all nested text; empty string if None.
+    For multiline content, joins all text with spaces and normalizes whitespace.
     """
-    value = (elem.text or '').strip() if elem is not None else ''
+    if elem is None:
+        return ''
+    # Use itertext() to get all text content including from child elements
+    all_text = ''.join(elem.itertext())
+    # Normalize whitespace: replace multiple spaces/newlines with single space
+    value = ' '.join(all_text.split())
     logger.debug(f"text() -> '{value[:100]}'" + ("..." if len(value) > 100 else ""))
     return value
 
@@ -1103,21 +1109,148 @@ def process_all_dashboards_recursively(root_dir: str) -> Tuple[
     logger.info(f"Recursive scan complete: {len(agg_dashboards)} dashboards found")
     return agg_dashboards, agg_page_refs, agg_pages, agg_columns, agg_sections, agg_report_views, agg_global_filters, agg_action_links
 
-def parse_global_filter_prompt(xml_path: str) -> List[Dict]:
+def build_filter_expression_string(expr_elem) -> str:
+    """
+    Recursively build a consolidated filter expression string from XML.
+    Returns a human-readable filter expression with logical operators.
+    """
+    if expr_elem is None:
+        return ''
+    
+    op = get_attr(expr_elem, 'op', '')
+    expr_type = strip_prefix(get_attr(expr_elem, '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+    
+    # Handle logical operators (and, or) - recursively process children
+    if expr_type == 'logical' and op in ('and', 'or'):
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        child_strings = []
+        for child in child_exprs:
+            child_str = build_filter_expression_string(child)
+            if child_str:
+                child_strings.append(f"({child_str})")
+        
+        if child_strings:
+            return f" {op.upper()} ".join(child_strings)
+        return ''
+    
+    # Handle list operators (in) - must check before comparison
+    elif expr_type == 'list' and op == 'in':
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 1:
+            column = text(child_exprs[0])
+            values = [text(child) for child in child_exprs[1:]]
+            if values:
+                values_str = ', '.join(values)
+                return f"{column} IN ({values_str})"
+            else:
+                return f"{column} IN ()"
+        return ''
+    
+    # Handle comparison operators
+    elif expr_type == 'comparison' or op in ('equal', 'in', 'greaterOrEqual', 'lessOrEqual', 'notEqual', 'greater', 'less'):
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 2:
+            # Extract left side - handle columnExpression type
+            left_type = strip_prefix(get_attr(child_exprs[0], '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+            if left_type == 'columnExpression':
+                # Extract from nested columnFormula
+                formula_elem = find(child_exprs[0], 'saw:columnFormula/sawx:expr')
+                if formula_elem is not None:
+                    left = text(formula_elem)
+                else:
+                    left = text(child_exprs[0])
+            else:
+                left = text(child_exprs[0])
+            
+            right = text(child_exprs[1])
+            op_symbol = {'equal': '=', 'notEqual': '!=', 'greaterOrEqual': '>=', 'lessOrEqual': '<=', 'greater': '>', 'less': '<'}.get(op, op)
+            return f"{left} {op_symbol} {right}"
+        elif len(child_exprs) == 1:
+            # Single child expression (shouldn't happen but handle it)
+            return text(child_exprs[0])
+        return ''
+    
+    # Handle special operators like prompted
+    elif expr_type == 'special' and op == 'prompted':
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 1:
+            column = text(child_exprs[0])
+            return f"{column} IS PROMPTED"
+        return ''
+    
+    return ''
+
+def parse_filter_expression(expr_elem) -> List[Dict]:
+    """
+    Parse filter expressions and return a single consolidated filter object.
+    Returns a list with one dictionary containing the combined filter expression.
+    """
+    if expr_elem is None:
+        return []
+    
+    # Build the consolidated expression string
+    expression_string = build_filter_expression_string(expr_elem)
+    
+    if not expression_string:
+        return []
+    
+    # Get the top-level operator
+    op = get_attr(expr_elem, 'op', '')
+    expr_type = strip_prefix(get_attr(expr_elem, '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+    
+    # Extract all unique column names and table names from the expression
+    all_columns = set()
+    all_tables = set()
+    
+    def extract_columns_tables(elem):
+        """Recursively extract column and table names"""
+        for child in findall(elem, './/sawx:expr[@xsi:type="sawx:sqlExpression"]'):
+            expr_text = text(child)
+            if expr_text and '"' in expr_text:
+                parts = expr_text.split('"')
+                if len(parts) >= 2:
+                    all_tables.add(parts[1])
+                if len(parts) >= 4:
+                    all_columns.add(parts[3])
+    
+    extract_columns_tables(expr_elem)
+    
+    return [{
+        'operator': op,
+        'parent_operator': '',
+        'column_expression': expression_string,
+        'column_name': '|'.join(sorted(all_columns)) if all_columns else '',
+        'table_name': '|'.join(sorted(all_tables)) if all_tables else '',
+        'filter_value': '',
+    }]
+
+def parse_global_filter_prompt(xml_path: str) -> Tuple[str, str, List[Dict]]:
     """
     Parse a global filter prompt XML file and extract prompt details.
-    Returns list of prompt dictionaries with column info.
+    Returns: (view_type, instruction, list of prompt dictionaries with column info)
     """
     logger.info(f"Parsing global filter prompt: {xml_path}")
     prompts = []
+    view_type = ''
+    instruction = ''
     
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
         
+        # Extract view type from root element (e.g., globalFilterPrompt)
+        view_type = strip_prefix(get_attr(root, '{%s}type' % NAMESPACES['xsi']), 'saw:')
+        
         # Extract subject area
         prompts_elem = find(root, 'saw:prompts')
         subject_area = get_attr(prompts_elem, 'subjectArea', '') if prompts_elem else ''
+        
+        # Extract instruction from promptStep > instruction > caption > text
+        prompt_step = find(root, './/saw:promptStep')
+        if prompt_step is not None:
+            instruction_elem = find(prompt_step, 'saw:instruction/saw:caption/saw:text')
+            if instruction_elem is not None:
+                instruction = text(instruction_elem)
         
         # Extract individual prompts
         for prompt in findall(root, './/saw:prompt'):
@@ -1126,8 +1259,21 @@ def parse_global_filter_prompt(xml_path: str) -> List[Dict]:
             required = get_attr(prompt, 'required', 'false')
             
             # Extract formula/expression
+            # Handle different formula types: sqlExpression, columnExpression
             formula_elem = find(prompt, 'saw:formula/sawx:expr')
-            if not formula_elem:
+            if formula_elem is not None:
+                expr_type = strip_prefix(get_attr(formula_elem, '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+                if expr_type == 'columnExpression':
+                    # For columnExpression, extract the display formula
+                    display_formula = find(formula_elem, 'saw:columnFormula[@formulaUse="display"]/sawx:expr')
+                    if display_formula is not None:
+                        expression = text(display_formula)
+                    else:
+                        expression = text(formula_elem)
+                else:
+                    # For sqlExpression or other types
+                    expression = text(formula_elem)
+            else:
                 # Try without namespace prefix
                 formula = find(prompt, 'saw:formula')
                 if formula is not None:
@@ -1137,8 +1283,6 @@ def parse_global_filter_prompt(xml_path: str) -> List[Dict]:
                         break
                 else:
                     expression = ''
-            else:
-                expression = text(formula_elem)
             
             # Extract operator
             operator_elem = find(prompt, 'saw:promptOperator')
@@ -1147,14 +1291,86 @@ def parse_global_filter_prompt(xml_path: str) -> List[Dict]:
             else:
                 operator = ''
             
-            # Extract UI control type
-            ui_control = find(prompt, 'saw:promptUIControl')
-            control_type = strip_prefix(get_attr(ui_control, '{%s}type' % NAMESPACES['xsi']), 'saw:') if ui_control else ''
+            # Extract prompt name from label > caption > text
+            prompt_name = ''
+            label_elem = find(prompt, 'saw:label/saw:caption/saw:text')
+            if label_elem is not None:
+                prompt_name = text(label_elem)
             
-            # Extract default values
+            # Extract UI control type and attributes
+            ui_control = find(prompt, 'saw:promptUIControl')
+            control_type = ''
+            max_choices = ''
+            include_all_choices = ''
+            if ui_control is not None:
+                control_type = strip_prefix(get_attr(ui_control, '{%s}type' % NAMESPACES['xsi']), 'saw:')
+                max_choices = get_attr(ui_control, 'maxChoices', '')
+                include_all_choices = get_attr(ui_control, 'includeAllChoices', '')
+            
+            # Extract default values with type and usingCodeValue
             default_values = []
-            for default in findall(prompt, 'saw:promptDefaultValues/saw:promptDefaultValue'):
-                default_values.append(text(default))
+            default_values_elem = find(prompt, 'saw:promptDefaultValues')
+            default_values_type = ''
+            using_code_value = ''
+            if default_values_elem is not None:
+                default_values_type = get_attr(default_values_elem, 'type', '')
+                using_code_value = get_attr(default_values_elem, 'usingCodeValue', '')
+                for default in findall(prompt, 'saw:promptDefaultValues/saw:promptDefaultValue'):
+                    default_values.append(text(default))
+            
+            # Extract constrainPrompt
+            constrain_prompt_elem = find(prompt, 'saw:constrainPrompt')
+            constrain_prompt_type = ''
+            auto_select_value = ''
+            if constrain_prompt_elem is not None:
+                constrain_prompt_type = get_attr(constrain_prompt_elem, 'type', '')
+                auto_select_value = get_attr(constrain_prompt_elem, 'autoSelectValue', '')
+            
+            # Extract setPromptVariables - now as separate fields
+            prompt_var_locations = []
+            prompt_var_types = []
+            prompt_var_formulas = []
+            for var in findall(prompt, 'saw:setPromptVariables/saw:setPromptVariable'):
+                var_location = get_attr(var, 'location', '')
+                var_type = get_attr(var, 'type', '')
+                var_formula = get_attr(var, 'variableFormula', '')
+                prompt_var_locations.append(var_location)
+                prompt_var_types.append(var_type)
+                prompt_var_formulas.append(var_formula)
+            
+            # Extract promptSource with type, sourceFormula, and promptChoices
+            prompt_source_elem = find(prompt, 'saw:promptSource')
+            prompt_source_type = ''
+            prompt_choices = []
+            source_formula = ''
+            if prompt_source_elem is not None:
+                prompt_source_type = strip_prefix(get_attr(prompt_source_elem, '{%s}type' % NAMESPACES['xsi']), 'saw:')
+                
+                # For sqlPromptSource, extract sourceFormula attribute
+                if prompt_source_type == 'sqlPromptSource':
+                    source_formula = get_attr(prompt_source_elem, 'sourceFormula', '')
+                
+                # For specificChoices, extract prompt choices from saw:value
+                if prompt_source_type == 'specificChoices':
+                    for choice in findall(prompt, 'saw:promptSource/saw:promptChoices/saw:promptChoice'):
+                        # Try to get text from caption > text first
+                        choice_text_elem = find(choice, 'saw:caption/saw:text')
+                        if choice_text_elem is not None:
+                            choice_text = text(choice_text_elem)
+                            if choice_text:
+                                prompt_choices.append(choice_text)
+                        else:
+                            # Try saw:value element
+                            value_elem = find(choice, 'saw:value')
+                            if value_elem is not None:
+                                choice_text = text(value_elem)
+                                if choice_text:
+                                    prompt_choices.append(choice_text)
+                            else:
+                                # Fallback to direct text
+                                choice_text = text(choice)
+                                if choice_text:
+                                    prompt_choices.append(choice_text)
             
             # Parse column name from expression
             column_name = ''
@@ -1170,21 +1386,35 @@ def parse_global_filter_prompt(xml_path: str) -> List[Dict]:
             prompts.append({
                 'subject_area': subject_area.strip('"'),
                 'prompt_type': prompt_type,
+                'prompt_name': prompt_name,
                 'column_id': column_id,
                 'required': required,
                 'expression': expression,
                 'operator': operator,
                 'control_type': control_type,
-                'default_values': ', '.join(default_values),
+                'max_choices': max_choices,
+                'include_all_choices': include_all_choices,
+                'default_values': '|'.join(default_values) if default_values else '',
+                'default_values_type': default_values_type,
+                'using_code_value': using_code_value,
+                'constrain_prompt_type': constrain_prompt_type,
+                'auto_select_value': auto_select_value,
+                'prompt_var_location': '|'.join(prompt_var_locations) if prompt_var_locations else '',
+                'prompt_var_type': '|'.join(prompt_var_types) if prompt_var_types else '',
+                'prompt_var_formula': '|'.join(prompt_var_formulas) if prompt_var_formulas else '',
+                'prompt_source_type': prompt_source_type,
+                'prompt_choices': '|'.join(prompt_choices) if prompt_choices else '',
+                'source_formula': source_formula,
                 'table_name': table_name,
                 'column_name': column_name,
+                'instruction': instruction,
             })
         
         logger.info(f"Extracted {len(prompts)} prompts from {xml_path}")
     except Exception as exc:
         logger.warning(f"Failed to parse global filter prompt '{xml_path}': {exc}")
     
-    return prompts
+    return view_type, instruction, prompts
 
 def process_all_reports_recursively(root_dir: str) -> Dict[str, Dict]:
     """
@@ -1224,11 +1454,13 @@ def process_all_reports_recursively(root_dir: str) -> Dict[str, Dict]:
             if 'prompt' in fname.lower() or 'prompt' in dirpath.lower():
                 try:
                     # Attempting to parse prompt file
-                    prompt_data = parse_global_filter_prompt(fpath)
+                    view_type, instruction, prompt_data = parse_global_filter_prompt(fpath)
                     if prompt_data:
                         prompts_map[report_path] = {
                             'file_path': fpath,
                             'prompt_path': report_path,
+                            'view_type': view_type,
+                            'instruction': instruction,
                             'prompt_data': prompt_data
                         }
                         logger.info(f"Parsed prompt: {report_path}")
@@ -1863,11 +2095,47 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
         if report_info:
             report_data = report_info.get('report_data', ())
             if len(report_data) >= 3:
+                report_rows = report_data[0]
                 column_rows = report_data[1]
                 column_order_rows = report_data[2]
                 
                 # Create column lookup
                 col_map = {col.get('column_id', ''): col for col in column_rows}
+                
+                # Extract report-level filters from criteria/filter
+                # Parse all filter expressions including complex logical operators
+                try:
+                    file_path = report_info.get('file_path', '')
+                    if file_path and os.path.exists(file_path):
+                        tree = ET.parse(file_path)
+                        root = tree.getroot()
+                        
+                        # Find the main filter expression
+                        main_filter_expr = find(root, './/saw:criteria/saw:filter/sawx:expr')
+                        if main_filter_expr is not None:
+                            # Parse all filter expressions recursively
+                            parsed_filters = parse_filter_expression(main_filter_expr)
+                            
+                            for filter_info in parsed_filters:
+                                filter_rows.append({
+                                    'WorksheetName': page_name,
+                                    'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
+                                    'ReportName': report_name,
+                                    'FilterType': 'ReportFilter',
+                                    'ColumnId': '',
+                                    'ColumnName': filter_info.get('column_name', ''),
+                                    'TableName': filter_info.get('table_name', ''),
+                                    'Direction': '',
+                                    'Expression': filter_info.get('column_expression', ''),
+                                    'Operator': filter_info.get('operator', ''),
+                                    'ParentOperator': filter_info.get('parent_operator', ''),
+                                    'FilterValue': filter_info.get('filter_value', ''),
+                                    'WorksheetPath': worksheet_path,
+                                    'DashboardPath': dashboard_name_to_catalog_path(dashboard_path),
+                                    'ReportPath': report_path,
+                                })
+                except Exception as exc:
+                    logger.warning(f"Failed to extract report filters from {file_path}: {exc}")
                 
                 # Extract filters from column orders (sort filters)
                 for order in column_order_rows:
@@ -1918,23 +2186,42 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
             prompt_info = prompts_map_lower.get(filter_path_encoded.lower())
         
         if prompt_info:
+            view_type = prompt_info.get('view_type', '')
+            instruction = prompt_info.get('instruction', '')
             prompt_data_list = prompt_info.get('prompt_data', [])
             for prompt_data in prompt_data_list:
                 filter_rows.append({
                     'WorksheetName': page_name,
                     'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
-                    'ReportName': 'Global Filter',
-                    'FilterType': 'Prompt',
+                    'ReportName': '',  # Empty for global filters as requested
+                    'FilterType': view_type if view_type else 'Prompt',  # Use actual view type from XML
+                    'PromptType': prompt_data.get('prompt_type', ''),
+                    'PromptName': prompt_data.get('prompt_name', ''),
+                    'Formula': prompt_data.get('expression', ''),
                     'ColumnId': prompt_data.get('column_id', ''),
                     'ColumnName': prompt_data.get('column_name', ''),
                     'TableName': prompt_data.get('table_name', ''),
                     'Direction': '',
                     'Expression': prompt_data.get('expression', ''),
-                    'PromptType': prompt_data.get('prompt_type', ''),
                     'Operator': prompt_data.get('operator', ''),
+                    'ParentOperator': '',
+                    'FilterValue': '',
                     'ControlType': prompt_data.get('control_type', ''),
+                    'MaxChoices': prompt_data.get('max_choices', ''),
+                    'IncludeAllChoices': prompt_data.get('include_all_choices', ''),
                     'Required': prompt_data.get('required', ''),
                     'DefaultValues': prompt_data.get('default_values', ''),
+                    'DefaultValuesType': prompt_data.get('default_values_type', ''),
+                    'UsingCodeValue': prompt_data.get('using_code_value', ''),
+                    'ConstrainPromptType': prompt_data.get('constrain_prompt_type', ''),
+                    'AutoSelectValue': prompt_data.get('auto_select_value', ''),
+                    'PromptVarLocation': prompt_data.get('prompt_var_location', ''),
+                    'PromptVarType': prompt_data.get('prompt_var_type', ''),
+                    'PromptVarFormula': prompt_data.get('prompt_var_formula', ''),
+                    'PromptSourceType': prompt_data.get('prompt_source_type', ''),
+                    'PromptChoices': prompt_data.get('prompt_choices', ''),
+                    'SourceFormula': prompt_data.get('source_formula', ''),
+                    'Instruction': prompt_data.get('instruction', ''),
                     'SubjectArea': prompt_data.get('subject_area', ''),
                     'WorksheetPath': worksheet_path,
                     'DashboardPath': dashboard_path,
@@ -1945,7 +2232,7 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
             filter_rows.append({
                 'WorksheetName': page_name,
                 'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
-                'ReportName': 'Global Filter',
+                'ReportName': '',  # Empty for global filters
                 'FilterType': 'Prompt',
                 'ColumnId': '',
                 'ColumnName': gf.get('caption', ''),
@@ -2242,9 +2529,12 @@ def main() -> int:
     
     write_csv(os.path.join(output_dir, 'Filters.csv'),
               ['WorksheetName', 'DashboardName', 'ReportName',
-               'FilterType', 'ColumnId', 'ColumnName', 'TableName', 'Direction', 'Expression',
-               'PromptType', 'Operator', 'ControlType', 'Required', 'DefaultValues', 'SubjectArea',
-               'WorksheetPath', 'DashboardPath', 'ReportPath'],
+               'FilterType', 'PromptType', 'PromptName', 'Formula', 'ColumnId', 'ColumnName', 'TableName', 
+               'Direction', 'Expression', 'Operator', 'ParentOperator', 'FilterValue', 'ControlType', 
+               'MaxChoices', 'IncludeAllChoices', 'Required', 'DefaultValues', 'DefaultValuesType', 
+               'UsingCodeValue', 'ConstrainPromptType', 'AutoSelectValue', 'PromptVarLocation', 
+               'PromptVarType', 'PromptVarFormula', 'PromptSourceType', 'PromptChoices', 'SourceFormula', 
+               'Instruction', 'SubjectArea', 'WorksheetPath', 'DashboardPath', 'ReportPath'],
               filter_rows)
     logger.info(f"Filters.csv: {len(filter_rows)} rows")
     
