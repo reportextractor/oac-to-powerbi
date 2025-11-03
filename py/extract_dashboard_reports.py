@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import argparse
+import json
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple
 import re
@@ -1350,27 +1351,26 @@ def parse_global_filter_prompt(xml_path: str) -> Tuple[str, str, List[Dict]]:
                 if prompt_source_type == 'sqlPromptSource':
                     source_formula = get_attr(prompt_source_elem, 'sourceFormula', '')
                 
-                # For specificChoices, extract prompt choices from saw:value
-                if prompt_source_type == 'specificChoices':
-                    for choice in findall(prompt, 'saw:promptSource/saw:promptChoices/saw:promptChoice'):
+                # For specificChoices or choiceList, extract prompt choices
+                if prompt_source_type in ('specificChoices', 'choiceList'):
+                    for choice in findall(prompt_source_elem, './/saw:promptChoice'):
                         # Try to get text from caption > text first
-                        choice_text_elem = find(choice, 'saw:caption/saw:text')
+                        choice_text = ''
+                        choice_text_elem = find(choice, './/saw:caption/saw:text')
                         if choice_text_elem is not None:
                             choice_text = text(choice_text_elem)
-                            if choice_text:
-                                prompt_choices.append(choice_text)
-                        else:
-                            # Try saw:value element
-                            value_elem = find(choice, 'saw:value')
+                        
+                        # If no caption text, try saw:value element
+                        if not choice_text:
+                            value_elem = find(choice, './/saw:value')
                             if value_elem is not None:
                                 choice_text = text(value_elem)
-                                if choice_text:
-                                    prompt_choices.append(choice_text)
                             else:
-                                # Fallback to direct text
+                                # Fallback to direct text content
                                 choice_text = text(choice)
-                                if choice_text:
-                                    prompt_choices.append(choice_text)
+                        
+                        if choice_text:
+                            prompt_choices.append(choice_text.strip())
             
             # Parse column name from expression
             column_name = ''
@@ -1382,6 +1382,48 @@ def parse_global_filter_prompt(xml_path: str) -> Tuple[str, str, List[Dict]]:
                     table_name = parts[1]
                 if len(parts) >= 4:
                     column_name = parts[3]
+            
+            # Extract UI control styling and formatting information
+            style = {}
+            layout = {}
+            position = {}
+            display = {}
+            
+            # Extract from promptUIControl element
+            if ui_control is not None:
+                # Get all attributes from promptUIControl
+                for attr_name, attr_value in ui_control.attrib.items():
+                    clean_name = attr_name.split('}')[-1]
+                    if clean_name not in ('type',):  # Skip type as it's already captured
+                        style[clean_name] = attr_value
+                
+                # Extract customWidth if present
+                custom_width = find(ui_control, 'saw:customWidth')
+                if custom_width is not None:
+                    layout['customWidth'] = get_attr(custom_width, 'width', '')
+                    layout['customWidthUsing'] = get_attr(custom_width, 'using', '')
+                
+                # Extract customHeight if present
+                custom_height = find(ui_control, 'saw:customHeight')
+                if custom_height is not None:
+                    layout['customHeight'] = get_attr(custom_height, 'height', '')
+                    layout['customHeightUsing'] = get_attr(custom_height, 'using', '')
+            
+            # Extract from promptStep level (if available)
+            prompt_step_parent = find(root, './/saw:promptStep')
+            if prompt_step_parent is not None:
+                # Check for customWidth at promptStep level
+                step_width = find(prompt_step_parent, 'saw:customWidth')
+                if step_width is not None:
+                    layout['stepCustomWidth'] = get_attr(step_width, 'width', '')
+                    layout['stepCustomWidthUsing'] = get_attr(step_width, 'using', '')
+            
+            # Extract promptSource attributes
+            if prompt_source_elem is not None:
+                for attr_name, attr_value in prompt_source_elem.attrib.items():
+                    clean_name = attr_name.split('}')[-1]
+                    if clean_name not in ('type',):
+                        display[clean_name] = attr_value
             
             prompts.append({
                 'subject_area': subject_area.strip('"'),
@@ -1408,15 +1450,23 @@ def parse_global_filter_prompt(xml_path: str) -> Tuple[str, str, List[Dict]]:
                 'table_name': table_name,
                 'column_name': column_name,
                 'instruction': instruction,
+                'style': json.dumps(style) if style else '',
+                'layout': json.dumps(layout) if layout else '',
+                'position': json.dumps(position) if position else '',
+                'display': json.dumps(display) if display else ''
             })
+            
+            # Log detailed information about prompt choices for debugging
+            if prompt_choices:
+                logger.debug(f"Found {len(prompt_choices)} prompt choices for {prompt_name}: {', '.join(prompt_choices)}")
         
         logger.info(f"Extracted {len(prompts)} prompts from {xml_path}")
     except Exception as exc:
-        logger.warning(f"Failed to parse global filter prompt '{xml_path}': {exc}")
+        logger.error(f"Failed to parse global filter prompt '{xml_path}': {exc}", exc_info=True)
     
     return view_type, instruction, prompts
 
-def process_all_reports_recursively(root_dir: str) -> Dict[str, Dict]:
+def process_all_reports_recursively(root_dir: str) -> Tuple[Dict, Dict]:
     """
     Recursively scan for report XML files (excluding .atr files and dashboard files) and parse them.
     Returns a dictionary mapping report_path -> report_data
@@ -2110,13 +2160,35 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                         tree = ET.parse(file_path)
                         root = tree.getroot()
                         
+                        # Extract criteria-level attributes for formatting
+                        criteria_elem = find(root, './/saw:criteria')
+                        criteria_attrs = {}
+                        if criteria_elem is not None:
+                            for attr_name, attr_value in criteria_elem.attrib.items():
+                                clean_name = attr_name.split('}')[-1]
+                                if clean_name not in ('type',):
+                                    criteria_attrs[clean_name] = attr_value
+                        
                         # Find the main filter expression
-                        main_filter_expr = find(root, './/saw:criteria/saw:filter/sawx:expr')
+                        filter_elem = find(root, './/saw:criteria/saw:filter')
+                        main_filter_expr = find(filter_elem, 'sawx:expr') if filter_elem is not None else None
+                        
+                        # Extract filter-level attributes
+                        filter_attrs = {}
+                        if filter_elem is not None:
+                            for attr_name, attr_value in filter_elem.attrib.items():
+                                clean_name = attr_name.split('}')[-1]
+                                filter_attrs[clean_name] = attr_value
+                        
                         if main_filter_expr is not None:
                             # Parse all filter expressions recursively
                             parsed_filters = parse_filter_expression(main_filter_expr)
                             
                             for filter_info in parsed_filters:
+                                # Build style/layout info from criteria and filter attributes
+                                style_info = filter_attrs.copy()
+                                layout_info = criteria_attrs.copy()
+                                
                                 filter_rows.append({
                                     'WorksheetName': page_name,
                                     'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
@@ -2130,6 +2202,10 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                                     'Operator': filter_info.get('operator', ''),
                                     'ParentOperator': filter_info.get('parent_operator', ''),
                                     'FilterValue': filter_info.get('filter_value', ''),
+                                    'Style': json.dumps(style_info) if style_info else '',
+                                    'Layout': json.dumps(layout_info) if layout_info else '',
+                                    'Position': '',
+                                    'Display': '',
                                     'WorksheetPath': worksheet_path,
                                     'DashboardPath': dashboard_name_to_catalog_path(dashboard_path),
                                     'ReportPath': report_path,
@@ -2153,6 +2229,12 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                         if len(parts) >= 4:
                             column_name = parts[3]
                     
+                    # Extract sort order attributes
+                    sort_attrs = {}
+                    for key, value in order.items():
+                        if key not in ('column_id', 'direction'):
+                            sort_attrs[key] = value
+                    
                     filter_rows.append({
                         'WorksheetName': page_name,
                         'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
@@ -2163,6 +2245,10 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                         'TableName': table_name,
                         'Direction': order.get('direction', ''),
                         'Expression': expression,
+                        'Style': json.dumps(sort_attrs) if sort_attrs else '',
+                        'Layout': '',
+                        'Position': '',
+                        'Display': '',
                         'WorksheetPath': worksheet_path,
                         'DashboardPath': dashboard_name_to_catalog_path(dashboard_path),
                         'ReportPath': report_path,
@@ -2177,6 +2263,18 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
         dashboard_name = gf.get('dashboard_name', '').replace('+', ' ')
         dashboard_path = gf.get('dashboard_name', '')
         
+        # Extract dashboard page layout information
+        section_name = gf.get('section_name', '')
+        column_name = gf.get('column_name', '')
+        filter_index = gf.get('filter_index', '')
+        
+        # Build position info from dashboard page structure
+        position_info = {
+            'columnName': column_name,
+            'sectionName': section_name,
+            'filterIndex': str(filter_index)
+        }
+        
         # Look up prompt details (try both original and URL-decoded versions)
         prompt_info = prompts_map_lower.get(filter_path.lower())
         if not prompt_info:
@@ -2190,7 +2288,16 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
             instruction = prompt_info.get('instruction', '')
             prompt_data_list = prompt_info.get('prompt_data', [])
             for prompt_data in prompt_data_list:
-                filter_rows.append({
+                # Merge position info with prompt position data
+                combined_position = position_info.copy()
+                if prompt_data.get('position'):
+                    try:
+                        prompt_pos = json.loads(prompt_data.get('position', '{}'))
+                        combined_position.update(prompt_pos)
+                    except:
+                        pass
+                
+                filter_row = {
                     'WorksheetName': page_name,
                     'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
                     'ReportName': '',  # Empty for global filters as requested
@@ -2223,10 +2330,15 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                     'SourceFormula': prompt_data.get('source_formula', ''),
                     'Instruction': prompt_data.get('instruction', ''),
                     'SubjectArea': prompt_data.get('subject_area', ''),
+                    'Style': prompt_data.get('style', ''),
+                    'Layout': prompt_data.get('layout', ''),
+                    'Position': json.dumps(combined_position) if combined_position else '',
+                    'Display': prompt_data.get('display', ''),
                     'WorksheetPath': worksheet_path,
                     'DashboardPath': dashboard_path,
                     'ReportPath': filter_path,
-                })
+                }
+                filter_rows.append(filter_row)
         else:
             # Fallback if prompt not parsed
             filter_rows.append({
@@ -2534,7 +2646,8 @@ def main() -> int:
                'MaxChoices', 'IncludeAllChoices', 'Required', 'DefaultValues', 'DefaultValuesType', 
                'UsingCodeValue', 'ConstrainPromptType', 'AutoSelectValue', 'PromptVarLocation', 
                'PromptVarType', 'PromptVarFormula', 'PromptSourceType', 'PromptChoices', 'SourceFormula', 
-               'Instruction', 'SubjectArea', 'WorksheetPath', 'DashboardPath', 'ReportPath'],
+               'Instruction', 'SubjectArea', 'Style', 'Layout', 'Position', 'Display', 
+               'WorksheetPath', 'DashboardPath', 'ReportPath'],
               filter_rows)
     logger.info(f"Filters.csv: {len(filter_rows)} rows")
     
