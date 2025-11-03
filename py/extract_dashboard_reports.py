@@ -1257,7 +1257,7 @@ def parse_filter_expression(expr_elem, parent_op='') -> List[Dict]:
             val = text(child)
             if val:
                 values.append(val)
-        filter_value = '|'.join(values) if values else ''
+        filter_value = ' | '.join(values) if values else ''
     elif op in ('equal', 'notEqual', 'greaterOrEqual', 'lessOrEqual', 'greater', 'less'):
         # Comparison operators: extract the right-hand value (second child)
         child_exprs = findall(expr_elem, 'sawx:expr')
@@ -1272,7 +1272,7 @@ def parse_filter_expression(expr_elem, parent_op='') -> List[Dict]:
             # Format: column BETWEEN lower AND upper
             lower = text(child_exprs[1])
             upper = text(child_exprs[2])
-            filter_value = f"{lower}|{upper}"
+            filter_value = f"{lower} | {upper}"
         else:
             filter_value = ''
     elif op in ('null', 'notNull', 'isNull', 'isNotNull'):
@@ -1294,7 +1294,7 @@ def parse_filter_expression(expr_elem, parent_op='') -> List[Dict]:
         # Fix IN operator - if operator is 'in' but expression doesn't contain 'IN', reconstruct
         elif op == 'in' and (not expression_string or 'IN' not in expression_string.upper()):
             if filter_value:
-                expression_string = f'"{table_name}"."{column_name}" IN ({filter_value.replace("|", ", ")})'
+                expression_string = f'"{table_name}"."{column_name}" IN ({filter_value.replace(" | ", ", ")})'
             else:
                 expression_string = f'"{table_name}"."{column_name}" IN ()'
     
@@ -1333,6 +1333,19 @@ def build_single_filter_expression(expr_elem) -> str:
             else:
                 # Empty IN clause - still return the structure
                 return f"{column} IN ()"
+        return ''
+    
+    # Handle BETWEEN operator
+    elif op == 'between':
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 3:
+            column = text(child_exprs[0])
+            lower = text(child_exprs[1])
+            upper = text(child_exprs[2])
+            return f"{column} BETWEEN {lower} AND {upper}"
+        elif len(child_exprs) >= 1:
+            # Incomplete BETWEEN - just return column
+            return text(child_exprs[0])
         return ''
     
     # Handle comparison operators
@@ -2351,9 +2364,10 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                                 style_info = filter_attrs.copy()
                                 layout_info = criteria_attrs.copy()
                                 
-                                # Extract subjectArea and withinHierarchy to separate columns
+                                # Extract subjectArea to separate column, remove withinHierarchy
                                 subject_area = layout_info.pop('subjectArea', '').strip('"')
-                                within_hierarchy = layout_info.pop('withinHierarchy', '')
+                                # Remove withinHierarchy from layout (not needed in output)
+                                layout_info.pop('withinHierarchy', '')
                                 
                                 filter_rows.append({
                                     'WorksheetName': page_name,
@@ -2372,7 +2386,7 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                                     'Style': json.dumps(style_info) if style_info else '',
                                     'Layout': json.dumps(layout_info) if layout_info else '',
                                     'Position': '',
-                                    'Display': json.dumps({'withinHierarchy': within_hierarchy}) if within_hierarchy else '',
+                                    'Display': '',
                                     'WorksheetPath': worksheet_path,
                                     'DashboardPath': dashboard_name_to_catalog_path(dashboard_path),
                                     'ReportPath': report_path,
