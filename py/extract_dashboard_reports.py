@@ -1175,55 +1175,217 @@ def build_filter_expression_string(expr_elem) -> str:
     elif expr_type == 'special' and op == 'prompted':
         child_exprs = findall(expr_elem, 'sawx:expr')
         if len(child_exprs) >= 1:
-            column = text(child_exprs[0])
-            return f"{column} IS PROMPTED"
+            # For prompted filters, only extract the sqlExpression, not all text
+            child_type = strip_prefix(get_attr(child_exprs[0], '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+            if child_type == 'sqlExpression':
+                column = text(child_exprs[0])
+            elif child_type == 'columnExpression':
+                # Extract from nested columnFormula
+                formula_elem = find(child_exprs[0], 'saw:columnFormula/sawx:expr')
+                if formula_elem is not None:
+                    column = text(formula_elem)
+                else:
+                    column = child_exprs[0].text or ''
+            else:
+                # Fallback: get only direct text, not nested text
+                column = child_exprs[0].text or ''
+                if not column:
+                    # Try to find first sqlExpression child
+                    sql_expr = find(child_exprs[0], './/sawx:expr[@xsi:type="sawx:sqlExpression"]')
+                    if sql_expr is not None:
+                        column = text(sql_expr)
+            
+            if column:
+                return f"{column} IS PROMPTED"
         return ''
     
     return ''
 
-def parse_filter_expression(expr_elem) -> List[Dict]:
+def parse_filter_expression(expr_elem, parent_op='') -> List[Dict]:
     """
-    Parse filter expressions and return a single consolidated filter object.
-    Returns a list with one dictionary containing the combined filter expression.
+    Parse filter expressions and return individual filter conditions as separate rows.
+    Returns a list of dictionaries, one for each individual filter condition.
     """
     if expr_elem is None:
         return []
     
-    # Build the consolidated expression string
-    expression_string = build_filter_expression_string(expr_elem)
+    op = get_attr(expr_elem, 'op', '')
+    expr_type = strip_prefix(get_attr(expr_elem, '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+    
+    # Handle logical operators (and, or) - recursively process children and return separate rows
+    if expr_type == 'logical' and op in ('and', 'or'):
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        all_filters = []
+        for child in child_exprs:
+            child_filters = parse_filter_expression(child, parent_op=op)
+            all_filters.extend(child_filters)
+        return all_filters
+    
+    # For non-logical expressions, build the expression string and extract column/table
+    expression_string = build_single_filter_expression(expr_elem)
     
     if not expression_string:
         return []
     
-    # Get the top-level operator
-    op = get_attr(expr_elem, 'op', '')
-    expr_type = strip_prefix(get_attr(expr_elem, '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+    # Extract column and table name from this specific expression
+    column_name = ''
+    table_name = ''
+    filter_value = ''
     
-    # Extract all unique column names and table names from the expression
-    all_columns = set()
-    all_tables = set()
+    # Extract from sqlExpression elements
+    for sql_expr in findall(expr_elem, './/sawx:expr[@xsi:type="sawx:sqlExpression"]'):
+        expr_text = text(sql_expr)
+        if expr_text and '"' in expr_text:
+            parts = expr_text.split('"')
+            if len(parts) >= 2 and not table_name:
+                table_name = parts[1]
+            if len(parts) >= 4 and not column_name:
+                column_name = parts[3]
     
-    def extract_columns_tables(elem):
-        """Recursively extract column and table names"""
-        for child in findall(elem, './/sawx:expr[@xsi:type="sawx:sqlExpression"]'):
-            expr_text = text(child)
-            if expr_text and '"' in expr_text:
-                parts = expr_text.split('"')
-                if len(parts) >= 2:
-                    all_tables.add(parts[1])
-                if len(parts) >= 4:
-                    all_columns.add(parts[3])
+    # Extract filter values based on operator type
+    if op == 'prompted':
+        # IS PROMPTED filters should have empty filter value
+        filter_value = ''
+    elif op == 'in':
+        # IN operator: extract all values from the list
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        values = []
+        # Skip first child (it's the column), collect the rest as values
+        for i, child in enumerate(child_exprs):
+            if i == 0:
+                continue  # Skip column expression
+            val = text(child)
+            if val:
+                values.append(val)
+        filter_value = '|'.join(values) if values else ''
+    elif op in ('equal', 'notEqual', 'greaterOrEqual', 'lessOrEqual', 'greater', 'less'):
+        # Comparison operators: extract the right-hand value (second child)
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 2:
+            filter_value = text(child_exprs[1])
+        else:
+            filter_value = ''
+    elif op == 'between':
+        # BETWEEN operator: extract lower and upper bounds
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 3:
+            # Format: column BETWEEN lower AND upper
+            lower = text(child_exprs[1])
+            upper = text(child_exprs[2])
+            filter_value = f"{lower}|{upper}"
+        else:
+            filter_value = ''
+    elif op in ('null', 'notNull', 'isNull', 'isNotNull'):
+        # NULL checks don't have values
+        filter_value = ''
+    else:
+        # For other operators, try to extract any literal values
+        for literal_expr in findall(expr_elem, './/sawx:expr[@xsi:type="xsd:string"]'):
+            val = text(literal_expr)
+            if val:
+                filter_value = val
+                break
     
-    extract_columns_tables(expr_elem)
+    # If expression is incomplete or missing, reconstruct it
+    if table_name and column_name:
+        # Fix IS PROMPTED without column
+        if expression_string and 'IS PROMPTED' in expression_string and not expression_string.startswith('"'):
+            expression_string = f'"{table_name}"."{column_name}" IS PROMPTED'
+        # Fix IN operator - if operator is 'in' but expression doesn't contain 'IN', reconstruct
+        elif op == 'in' and (not expression_string or 'IN' not in expression_string.upper()):
+            if filter_value:
+                expression_string = f'"{table_name}"."{column_name}" IN ({filter_value.replace("|", ", ")})'
+            else:
+                expression_string = f'"{table_name}"."{column_name}" IN ()'
     
     return [{
         'operator': op,
-        'parent_operator': '',
+        'parent_operator': parent_op,
         'column_expression': expression_string,
-        'column_name': '|'.join(sorted(all_columns)) if all_columns else '',
-        'table_name': '|'.join(sorted(all_tables)) if all_tables else '',
-        'filter_value': '',
+        'column_name': column_name,
+        'table_name': table_name,
+        'filter_value': filter_value,
     }]
+
+def build_single_filter_expression(expr_elem) -> str:
+    """
+    Build a single filter expression string (non-recursive for logical operators).
+    """
+    if expr_elem is None:
+        return ''
+    
+    op = get_attr(expr_elem, 'op', '')
+    expr_type = strip_prefix(get_attr(expr_elem, '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+    
+    # Don't recurse into logical operators - just build this single expression
+    if expr_type == 'logical' and op in ('and', 'or'):
+        return ''
+    
+    # Handle IN operators first - check operator before type
+    if op == 'in':
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 1:
+            column = text(child_exprs[0])
+            values = [text(child) for child in child_exprs[1:]]
+            if values:
+                values_str = ', '.join(values)
+                return f"{column} IN ({values_str})"
+            else:
+                # Empty IN clause - still return the structure
+                return f"{column} IN ()"
+        return ''
+    
+    # Handle comparison operators
+    elif expr_type == 'comparison' or op in ('equal', 'greaterOrEqual', 'lessOrEqual', 'notEqual', 'greater', 'less'):
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 2:
+            # Extract left side
+            left_type = strip_prefix(get_attr(child_exprs[0], '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+            if left_type == 'columnExpression':
+                formula_elem = find(child_exprs[0], 'saw:columnFormula/sawx:expr')
+                if formula_elem is not None:
+                    left = text(formula_elem)
+                else:
+                    left = text(child_exprs[0])
+            else:
+                left = text(child_exprs[0])
+            
+            right = text(child_exprs[1])
+            op_symbol = {'equal': '=', 'notEqual': '!=', 'greaterOrEqual': '>=', 'lessOrEqual': '<=', 'greater': '>', 'less': '<'}.get(op, op)
+            return f"{left} {op_symbol} {right}"
+        elif len(child_exprs) == 1:
+            return text(child_exprs[0])
+        return ''
+    
+    # Handle special operators like prompted
+    elif expr_type == 'special' and op == 'prompted':
+        child_exprs = findall(expr_elem, 'sawx:expr')
+        if len(child_exprs) >= 1:
+            # For prompted filters, only extract the sqlExpression, not all text
+            child_type = strip_prefix(get_attr(child_exprs[0], '{%s}type' % NAMESPACES['xsi']), 'sawx:')
+            if child_type == 'sqlExpression':
+                column = text(child_exprs[0])
+            elif child_type == 'columnExpression':
+                # Extract from nested columnFormula
+                formula_elem = find(child_exprs[0], 'saw:columnFormula/sawx:expr')
+                if formula_elem is not None:
+                    column = text(formula_elem)
+                else:
+                    column = child_exprs[0].text or ''
+            else:
+                # Fallback: get only direct text, not nested text
+                column = child_exprs[0].text or ''
+                if not column:
+                    # Try to find first sqlExpression child
+                    sql_expr = find(child_exprs[0], './/sawx:expr[@xsi:type="sawx:sqlExpression"]')
+                    if sql_expr is not None:
+                        column = text(sql_expr)
+            
+            if column:
+                return f"{column} IS PROMPTED"
+        return ''
+    
+    return ''
 
 def parse_global_filter_prompt(xml_path: str) -> Tuple[str, str, List[Dict]]:
     """
@@ -2189,6 +2351,10 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                                 style_info = filter_attrs.copy()
                                 layout_info = criteria_attrs.copy()
                                 
+                                # Extract subjectArea and withinHierarchy to separate columns
+                                subject_area = layout_info.pop('subjectArea', '').strip('"')
+                                within_hierarchy = layout_info.pop('withinHierarchy', '')
+                                
                                 filter_rows.append({
                                     'WorksheetName': page_name,
                                     'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
@@ -2202,10 +2368,11 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                                     'Operator': filter_info.get('operator', ''),
                                     'ParentOperator': filter_info.get('parent_operator', ''),
                                     'FilterValue': filter_info.get('filter_value', ''),
+                                    'SubjectArea': subject_area,
                                     'Style': json.dumps(style_info) if style_info else '',
                                     'Layout': json.dumps(layout_info) if layout_info else '',
                                     'Position': '',
-                                    'Display': '',
+                                    'Display': json.dumps({'withinHierarchy': within_hierarchy}) if within_hierarchy else '',
                                     'WorksheetPath': worksheet_path,
                                     'DashboardPath': dashboard_name_to_catalog_path(dashboard_path),
                                     'ReportPath': report_path,
@@ -2297,6 +2464,20 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                     except:
                         pass
                 
+                # Extract filter value from default values for global filter prompts
+                filter_value = prompt_data.get('default_values', '')
+                operator = prompt_data.get('operator', '')
+                expression = prompt_data.get('expression', '')
+                column_name = prompt_data.get('column_name', '')
+                table_name = prompt_data.get('table_name', '')
+                
+                # If expression is incomplete for IN operator, reconstruct it
+                if operator == 'in' and expression and 'IN' not in expression.upper() and table_name and column_name:
+                    if filter_value:
+                        expression = f'"{table_name}"."{column_name}" IN ({filter_value})'
+                    else:
+                        expression = f'"{table_name}"."{column_name}" IN ()'
+                
                 filter_row = {
                     'WorksheetName': page_name,
                     'DashboardName': unquote(dashboard_name.replace('+', ' ').split("/")[-1]),
@@ -2304,15 +2485,15 @@ def create_filters_csv_data(agg_dashboard_report_views, agg_dashboard_global_fil
                     'FilterType': view_type if view_type else 'Prompt',  # Use actual view type from XML
                     'PromptType': prompt_data.get('prompt_type', ''),
                     'PromptName': prompt_data.get('prompt_name', ''),
-                    'Formula': prompt_data.get('expression', ''),
+                    'Formula': expression,
                     'ColumnId': prompt_data.get('column_id', ''),
-                    'ColumnName': prompt_data.get('column_name', ''),
-                    'TableName': prompt_data.get('table_name', ''),
+                    'ColumnName': column_name,
+                    'TableName': table_name,
                     'Direction': '',
-                    'Expression': prompt_data.get('expression', ''),
-                    'Operator': prompt_data.get('operator', ''),
+                    'Expression': expression,
+                    'Operator': operator,
                     'ParentOperator': '',
-                    'FilterValue': '',
+                    'FilterValue': filter_value,
                     'ControlType': prompt_data.get('control_type', ''),
                     'MaxChoices': prompt_data.get('max_choices', ''),
                     'IncludeAllChoices': prompt_data.get('include_all_choices', ''),

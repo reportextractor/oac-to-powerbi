@@ -3,19 +3,22 @@ import json
 import os
 import uuid
 
-def create_filter_config(row, index):
+def create_filter_config(row, index, tab_index):
     """Create a filter configuration dictionary from a CSV row"""
     # Generate a unique ID for the filter
     filter_id = str(uuid.uuid4().hex[:20])
     
     # Extract relevant fields from the CSV row
-    column_ref = f"{row['TableName']}.{row['ColumnName'].replace(' ', '')}"
+    # Keep spaces in column name for queryRef
+    column_name_no_space = row['ColumnName'].replace(' ', '')
+    column_ref = f"{row['TableName']}.{column_name_no_space}"
     dashboard_name = row.get('DashboardName', 'default')
     dashboard_tab = row.get('WorksheetName', 'default')
     
-    # Calculate position based on index to prevent overlap
-    x_pos = 1200 + (index % 2) * 350
-    y_pos = 200 + (index // 2) * 200
+    # Calculate position based on tab_index (per dashboard tab) to prevent overlap
+    # Use smaller y values appropriate for Power BI slicers
+    x_pos = 1200 + (tab_index % 2) * 350
+    y_pos = 200 + (tab_index // 2) * 200
     
     # Create the config dictionary structure with exact format
     config = {
@@ -86,16 +89,27 @@ def main():
         # Filter for global filters only
         global_filters = [row for row in rows if row.get('FilterType') == 'globalFilterPrompt']
         
-        # Convert each filter to the required format with index for positioning
-        output_data = [create_filter_config(filter_row, idx) for idx, filter_row in enumerate(global_filters)]
+        # Group by dashboard and tab first
+        dashboard_groups = {}
+        for filter_row in global_filters:
+            dashboard_name = filter_row.get('DashboardName', 'default')
+            tab_name = filter_row.get('WorksheetName', 'default')
+            key = f"{dashboard_name}::{tab_name}"
+            if key not in dashboard_groups:
+                dashboard_groups[key] = []
+            dashboard_groups[key].append(filter_row)
         
-        # Group by dashboard and tab
+        # Convert each filter with per-tab index for positioning
         dashboard_filters = {}
-        for item in output_data:
-            key = f"{item['dashboard']}::{item['tab']}"
-            if key not in dashboard_filters:
-                dashboard_filters[key] = []
-            dashboard_filters[key].append(item['config'])
+        global_idx = 0
+        for key, filters_in_tab in dashboard_groups.items():
+            dashboard_filters[key] = []
+            for tab_idx, filter_row in enumerate(filters_in_tab):
+                config_data = create_filter_config(filter_row, global_idx, tab_idx)
+                dashboard_filters[key].append(config_data['config'])
+                global_idx += 1
+        
+        output_data_count = global_idx
         
         # Write to output file with the exact format and dashboard association
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -117,7 +131,7 @@ def main():
                     is_first = False
             f.write('\n]')
             
-        print(f"Successfully created {output_file} with {len(output_data)} global filters across {len(dashboard_filters)} dashboard tabs.")
+        print(f"Successfully created {output_file} with {output_data_count} global filters across {len(dashboard_filters)} dashboard tabs.")
         
     except FileNotFoundError:
         print(f"Error: Could not find input file at {input_file}")
